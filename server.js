@@ -24,7 +24,7 @@ app.use(cors());
 const fs = require('fs');
 const path = require('path');
 const sources = fs.readdirSync(path.join(__dirname, 'sources'))
-  .filter(f => f.endsWith('.js'))
+  .filter(f => f.endsWith('.js'))&& !f.startsWith('_')
   .map(f => require('./sources/' + f));
 console.log('Loaded sources:', sources.map(s => s.id).join(', '));
 
