@@ -1,5 +1,8 @@
 /**
  * USGS — earthquakes, global. No key. Always-on baseline source.
+ * Shows everything nearby, plus significant quakes anywhere on Earth —
+ * "around the world" awareness was being silently cut by an over-tight
+ * radius filter; fixed to: all M2.5+ within 1000km, or M4.5+ anywhere.
  */
 const { haversine } = require('./_util');
 
@@ -12,7 +15,10 @@ async function fetchSource(lat, lon, radius) {
     const m = f.properties.mag; if (m == null) continue;
     const elat = f.geometry.coordinates[1], elon = f.geometry.coordinates[0];
     const d = haversine(lat, lon, elat, elon);
-    if (d > radius + 600) continue; // wide net for quakes
+    // near you: show everything. far away: only if it's actually significant.
+    const isNear = d <= Math.max(radius, 1000);
+    const isSignificant = m >= 4.5;
+    if (!isNear && !isSignificant) continue;
     const tsu = f.properties.tsunami === 1;
     events.push({
       id: 'us-' + f.id,
