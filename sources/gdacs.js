@@ -21,7 +21,9 @@ async function fetchSource(lat, lon, radius) {
     if (g.type === 'Point') { elon = g.coordinates[0]; elat = g.coordinates[1]; }
     else continue;
     if (!isFinite(elat) || !isFinite(elon)) continue;
-    if (haversine(lat, lon, elat, elon) > radius + 400) continue;
+    // GDACS is inherently a curated "significant events only" feed (~100 records,
+    // already filtered to real disasters) — no need to cut by distance at all.
+    // Distance is computed for display/sorting only.
 
     const alert = (p.alertlevel || '').toLowerCase(); // red / orange / green
     const sev = alert === 'red' ? 'critical' : alert === 'orange' ? 'warning' : 'watch';

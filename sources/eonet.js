@@ -16,8 +16,10 @@ async function fetchSource(lat, lon, radius) {
     else continue;
     const catId = ev.categories[0]?.id || '';
     if (catId === 'earthquakes') continue;
+    // EONET tracks open natural events worldwide (~100-200 active at once) —
+    // a global situational-awareness app should show all of them, not just
+    // ones within a tight radius. Distance is attached for sorting only.
     const d = haversine(lat, lon, elat, elon);
-    if (d > radius + 300) continue;
     const cat = categorize(ev.title) === 'other'
       ? (catId === 'wildfires' ? 'fire' : catId === 'volcanoes' ? 'other' : catId === 'severeStorms' ? 'storm' : 'other')
       : categorize(ev.title);
