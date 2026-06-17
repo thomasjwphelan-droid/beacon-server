@@ -17,7 +17,9 @@
  * ENV:
  *   PORT          default 8080
  *   CACHE_SECS    default 60  — how long to cache per location bucket
+ *   MAX_CACHE     default 250 — maximum location buckets kept in memory
  *   MAX_RADIUS    default 500 — hard cap on radius (km)
+ *   SOURCE_TIMEOUT_MS default 9000 — per-source fetch timeout
  *   LOG_REQUESTS  default 1   — set to 0 to silence request logs
  */
 
@@ -28,14 +30,29 @@ const fs       = require('fs');
 const path     = require('path');
 
 /* ─── config ─────────────────────────────────────────────────────────── */
-const PORT        = parseInt(process.env.PORT)       || 8080;
-const CACHE_MS    = (parseInt(process.env.CACHE_SECS) || 60) * 1000;
-const MAX_RADIUS  = parseInt(process.env.MAX_RADIUS) || 500;
-const LOG_REQ     = process.env.LOG_REQUESTS !== '0';
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const PORT              = parsePositiveInt(process.env.PORT, 8080);
+const CACHE_MS          = parsePositiveInt(process.env.CACHE_SECS, 60) * 1000;
+const MAX_CACHE         = parsePositiveInt(process.env.MAX_CACHE, 250);
+const MAX_RADIUS        = parsePositiveInt(process.env.MAX_RADIUS, 500);
+const SOURCE_TIMEOUT_MS = parsePositiveInt(process.env.SOURCE_TIMEOUT_MS, 9000);
+const LOG_REQ           = process.env.LOG_REQUESTS !== '0';
+const VERSION           = '2.1.0';
+
+const VALID_SEVERITIES = new Set(['critical', 'warning', 'watch']);
+const VALID_CATEGORIES = new Set([
+  'tsunami', 'quake', 'fire', 'flood', 'storm', 'hazmat', 'medical',
+  'traffic', 'police', 'cyber', 'air', 'space', 'other'
+]);
 
 /* ─── load source modules (skip _util and other helpers) ─────────────── */
 const SOURCES_DIR = path.join(__dirname, 'sources');
-const sources = fs.readdirSync(SOURCES_DIR)
+const sourceFiles = fs.existsSync(SOURCES_DIR) ? fs.readdirSync(SOURCES_DIR) : [];
+const sources = sourceFiles
   .filter(f => f.endsWith('.js') && !f.startsWith('_'))
   .map(f => {
     try {
@@ -59,17 +76,27 @@ console.log(`[BEACON] loaded ${sources.length} sources: ${sources.map(s => s.id)
 const health = {};
 sources.forEach(s => { health[s.id] = { ok: null, lastOk: null, lastErr: null, errors: 0, calls: 0 }; });
 
-function recordOk(id)  { const h = health[id]; h.ok = true;  h.lastOk  = Date.now(); h.calls++; }
-function recordErr(id, msg) { const h = health[id]; h.ok = false; h.lastErr = Date.now(); h.errors++; h.calls++; h.lastMsg = msg; }
+function recordOk(id)  { const h = health[id]; if (!h) return; h.ok = true;  h.lastOk  = Date.now(); h.calls++; }
+function recordErr(id, msg) {
+  const h = health[id];
+  if (!h) return;
+  h.ok = false; h.lastErr = Date.now(); h.errors++; h.calls++; h.lastMsg = String(msg || '').slice(0, 180);
+}
 
 /* ─── in-memory cache ─────────────────────────────────────────────────── */
 const cache = new Map();
 const keyFor = (lat, lon, r) => `${lat.toFixed(2)},${lon.toFixed(2)},${r}`;
 
+function setCache(key, data) {
+  cache.set(key, { t: Date.now(), data });
+  while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
+}
+
 // auto-clean old cache entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of cache) if (now - v.t > CACHE_MS * 5) cache.delete(k);
+  while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
 }, 5 * 60 * 1000);
 
 /* ─── haversine (for distance enrichment) ────────────────────────────── */
@@ -88,10 +115,74 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+function cleanText(value, fallback = '', limit = 240) {
+  const text = String(value ?? fallback).replace(/\s+/g, ' ').trim();
+  return text.slice(0, limit) || fallback;
+}
+
+function cleanUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeEvent(event, source, lat, lon) {
+  if (!event || typeof event !== 'object') return null;
+
+  const evLat = finiteNumber(event.lat);
+  const evLon = finiteNumber(event.lon);
+  const hasCoords = evLat !== null && evLon !== null && evLat >= -90 && evLat <= 90 && evLon >= -180 && evLon <= 180;
+  const parsedTime = finiteNumber(event.time) ?? Date.parse(event.time);
+  const time = Number.isFinite(parsedTime) ? parsedTime : Date.now();
+  const category = VALID_CATEGORIES.has(event.category) ? event.category : 'other';
+  const severity = VALID_SEVERITIES.has(event.severity) ? event.severity : 'watch';
+  const id = cleanText(event.id, `${source.id}-${category}-${time}`, 180);
+
+  return {
+    ...event,
+    id,
+    source: source.id,
+    sourceName: source.name,
+    category,
+    severity,
+    title: cleanText(event.title, `${source.name} event`, 240),
+    lat: hasCoords ? evLat : null,
+    lon: hasCoords ? evLon : null,
+    time,
+    address: cleanText(event.address, '', 160),
+    url: cleanUrl(event.url),
+    verified: Boolean(event.verified),
+    distance: hasCoords ? haversine(lat, lon, evLat, evLon) : null
+  };
+}
+
+function parseRadius(value) {
+  const radius = Math.abs(Number.parseFloat(value));
+  return Math.min(Number.isFinite(radius) && radius > 0 ? radius : 40, MAX_RADIUS);
+}
+
+function sourceCovers(source, lat, lon) {
+  if (!source.covers) return true;
+  try {
+    return Boolean(source.covers(lat, lon));
+  } catch (e) {
+    recordErr(source.id, `coverage check failed: ${e.message}`);
+    return false;
+  }
+}
+
 /* ─── express setup ──────────────────────────────────────────────────── */
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '32kb' }));
 
 // request logger
 app.use((req, _, next) => {
@@ -103,44 +194,14 @@ app.use((req, _, next) => {
 app.get('/', (_, res) => res.json({
   ok: true,
   service: 'beacon-aggregator',
-  version: '2.1.0',
+  version: VERSION,
   uptime: Math.round(process.uptime()) + 's',
   sources: sources.map(s => ({
     id: s.id, name: s.name, coverage: s.coverage || 'unspecified',
     health: health[s.id]
   })),
-  cache: { entries: cache.size, ttlSeconds: CACHE_MS / 1000 }
+  cache: { entries: cache.size, maxEntries: MAX_CACHE, ttlSeconds: CACHE_MS / 1000 }
 }));
-
-/* ─── GET /search — geocode a place name to lat/lon ──────────────────── */
-// Lets the app search ANY location, not just the user's GPS position.
-const geocodeCache = new Map();
-app.get('/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q || q.length < 2) return res.status(400).json({ error: 'q (place name) is required' });
-
-  const ck = q.toLowerCase();
-  const hit = geocodeCache.get(ck);
-  if (hit && Date.now() - hit.t < 24 * 3600 * 1000) return res.json(hit.data);
-
-  try {
-    const r = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(q)}`,
-      { headers: { 'User-Agent': 'BEACON/2.1 (public-safety-aggregator)' } }
-    );
-    const j = await r.json();
-    const results = (j || []).map(p => ({
-      name: p.display_name,
-      lat: parseFloat(p.lat), lon: parseFloat(p.lon),
-      type: p.type, importance: p.importance
-    }));
-    const data = { query: q, results };
-    geocodeCache.set(ck, { t: Date.now(), data });
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: 'Geocoding service unreachable', message: e.message });
-  }
-});
 
 /* ─── GET /sources — list all sources ────────────────────────────────── */
 app.get('/sources', (_, res) => res.json({
@@ -165,7 +226,7 @@ app.get('/health', (_, res) => {
 app.get('/events', async (req, res) => {
   const lat = parseFloat(req.query.lat);
   const lon = parseFloat(req.query.lon);
-  const radius = Math.min(Math.abs(parseFloat(req.query.radius) || 40), MAX_RADIUS);
+  const radius = parseRadius(req.query.radius);
 
   if (!isFinite(lat) || !isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
     return res.status(400).json({ error: 'Valid lat (-90–90) and lon (-180–180) are required.' });
@@ -181,14 +242,15 @@ app.get('/events', async (req, res) => {
   res.setHeader('X-Cache', 'MISS');
 
   // figure out which sources cover this point
-  const applicable  = sources.filter(s => !s.covers || s.covers(lat, lon));
-  const inapplicable = sources.filter(s =>  s.covers && !s.covers(lat, lon));
+  const coverage = sources.map(s => ({ source: s, covers: sourceCovers(s, lat, lon) }));
+  const applicable  = coverage.filter(x => x.covers).map(x => x.source);
+  const inapplicable = coverage.filter(x => !x.covers).map(x => x.source);
 
   // fetch from all applicable sources in parallel, with per-source timeout
   const results = await Promise.allSettled(
     applicable.map(s =>
-      withTimeout(s.fetch(lat, lon, radius), 9000, s.name)
-        .then(events => { recordOk(s.id); return { s, events: events || [] }; })
+      withTimeout(s.fetch(lat, lon, radius), SOURCE_TIMEOUT_MS, s.name)
+        .then(events => { recordOk(s.id); return { s, events: Array.isArray(events) ? events : [] }; })
         .catch(e  => { recordErr(s.id, e.message); throw e; })
     )
   );
@@ -204,15 +266,7 @@ app.get('/events', async (req, res) => {
   for (let i = 0; i < results.length; i++) {
     const r = results[i], s = applicable[i];
     if (r.status === 'fulfilled') {
-      const evs = r.value.events.map(e => ({
-        ...e,
-        source: s.id,
-        sourceName: s.name,
-        // enrich with distance from request point if event has coords
-        distance: (e.lat != null && e.lon != null)
-          ? haversine(lat, lon, e.lat, e.lon)
-          : null
-      }));
+      const evs = r.value.events.map(e => normalizeEvent(e, s, lat, lon)).filter(Boolean);
       out.events.push(...evs);
       out.sources.push({ id: s.id, name: s.name, status: 'ok', count: evs.length });
     } else {
@@ -246,14 +300,14 @@ app.get('/events', async (req, res) => {
     sourcesNotCovering: out.sources.filter(s => s.status === 'no-coverage').length
   };
 
-  cache.set(ck, { t: Date.now(), data: out });
+  setCache(ck, out);
   res.json(out);
 });
 
 /* ─── 404 handler ────────────────────────────────────────────────────── */
 app.use((req, res) => res.status(404).json({
   error: 'Not found',
-  available: ['GET /', 'GET /health', 'GET /sources', 'GET /search?q=', 'GET /events?lat=&lon=&radius=']
+  available: ['GET /', 'GET /health', 'GET /sources', 'GET /events?lat=&lon=&radius=']
 }));
 
 /* ─── global error handler ───────────────────────────────────────────── */
@@ -264,6 +318,6 @@ app.use((err, req, res, _next) => {
 
 /* ─── start ──────────────────────────────────────────────────────────── */
 app.listen(PORT, () => {
-  console.log(`[BEACON] aggregator v2 running on :${PORT}`);
-  console.log(`[BEACON] ${sources.length} sources ready | cache TTL: ${CACHE_MS / 1000}s`);
+  console.log(`[BEACON] aggregator v${VERSION} running on :${PORT}`);
+  console.log(`[BEACON] ${sources.length} sources ready | cache TTL: ${CACHE_MS / 1000}s | max cache: ${MAX_CACHE}`);
 });
