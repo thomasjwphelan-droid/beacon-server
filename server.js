@@ -103,7 +103,7 @@ app.use((req, _, next) => {
 app.get('/', (_, res) => res.json({
   ok: true,
   service: 'beacon-aggregator',
-  version: '2.0.0',
+  version: '2.1.0',
   uptime: Math.round(process.uptime()) + 's',
   sources: sources.map(s => ({
     id: s.id, name: s.name, coverage: s.coverage || 'unspecified',
@@ -111,6 +111,36 @@ app.get('/', (_, res) => res.json({
   })),
   cache: { entries: cache.size, ttlSeconds: CACHE_MS / 1000 }
 }));
+
+/* ─── GET /search — geocode a place name to lat/lon ──────────────────── */
+// Lets the app search ANY location, not just the user's GPS position.
+const geocodeCache = new Map();
+app.get('/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q || q.length < 2) return res.status(400).json({ error: 'q (place name) is required' });
+
+  const ck = q.toLowerCase();
+  const hit = geocodeCache.get(ck);
+  if (hit && Date.now() - hit.t < 24 * 3600 * 1000) return res.json(hit.data);
+
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(q)}`,
+      { headers: { 'User-Agent': 'BEACON/2.1 (public-safety-aggregator)' } }
+    );
+    const j = await r.json();
+    const results = (j || []).map(p => ({
+      name: p.display_name,
+      lat: parseFloat(p.lat), lon: parseFloat(p.lon),
+      type: p.type, importance: p.importance
+    }));
+    const data = { query: q, results };
+    geocodeCache.set(ck, { t: Date.now(), data });
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: 'Geocoding service unreachable', message: e.message });
+  }
+});
 
 /* ─── GET /sources — list all sources ────────────────────────────────── */
 app.get('/sources', (_, res) => res.json({
@@ -223,7 +253,7 @@ app.get('/events', async (req, res) => {
 /* ─── 404 handler ────────────────────────────────────────────────────── */
 app.use((req, res) => res.status(404).json({
   error: 'Not found',
-  available: ['GET /', 'GET /health', 'GET /sources', 'GET /events?lat=&lon=&radius=']
+  available: ['GET /', 'GET /health', 'GET /sources', 'GET /search?q=', 'GET /events?lat=&lon=&radius=']
 }));
 
 /* ─── global error handler ───────────────────────────────────────────── */
