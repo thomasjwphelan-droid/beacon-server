@@ -1,5 +1,6 @@
 'use strict';
 const R = 6371;
+const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS, 10) || 8000;
 
 function haversine(aLat, aLon, bLat, bLon) {
   const p = Math.PI / 180, x = (bLat - aLat) * p, y = (bLon - aLon) * p;
@@ -7,13 +8,28 @@ function haversine(aLat, aLon, bLat, bLon) {
   return Math.round(2 * R * Math.asin(Math.sqrt(h)) * 10) / 10;
 }
 
+// getJSON now actually cancels the underlying request on timeout via
+// AbortController, instead of just abandoning a promise that keeps running.
 async function getJSON(url, opts = {}) {
-  const r = await fetch(url, {
-    headers: { 'User-Agent': 'BEACON/2.0 (public-safety-aggregator)' },
-    ...opts
-  });
-  if (!r.ok) throw new Error(url.split('?')[0] + ' → ' + r.status);
-  return r.json();
+  const { headers = {}, timeoutMs = DEFAULT_TIMEOUT_MS, signal, ...rest } = opts;
+  const controller = signal ? null : new AbortController();
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  try {
+    const r = await fetch(url, {
+      ...rest,
+      signal: signal || controller.signal,
+      headers: {
+        'User-Agent': 'BEACON/2.2 (public-safety-aggregator)',
+        'Accept': 'application/json',
+        ...headers
+      }
+    });
+    if (!r.ok) throw new Error(url.split('?')[0] + ' → ' + r.status);
+    return r.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function categorize(t) {
@@ -27,16 +43,15 @@ function categorize(t) {
   if (/medical|cardiac|breathing|injury|fall|overdose|uncons/.test(s)) return 'medical';
   if (/collision|mvc|mva|crash|vehicle|traffic/.test(s))         return 'traffic';
   if (/assault|weapon|shoot|stab|robbery|gun|suspect/.test(s))   return 'police';
-  if (/cyber|malware|ransomware|exploit|cve|breach|hack/.test(s)) return 'cyber';
-  if (/air quality|pm2\.5|aqi|smog|smoke/.test(s))               return 'air';
+  if (/air quality|pm2\.5|aqi|smog/.test(s))                     return 'air';
   if (/geomagnetic|solar|aurora|radiation|space weather/.test(s)) return 'space';
   return 'other';
 }
 
 const SEV_ORDER = { critical: 0, warning: 1, watch: 2, other: 3 };
 function sevFor(c) {
-  if (['tsunami', 'fire', 'hazmat', 'quake', 'cyber'].includes(c)) return 'warning';
-  if (['flood', 'storm', 'police', 'space'].includes(c))           return 'warning';
+  if (['tsunami', 'fire', 'hazmat', 'quake'].includes(c)) return 'warning';
+  if (['flood', 'storm', 'police', 'space'].includes(c))  return 'warning';
   return 'watch';
 }
 

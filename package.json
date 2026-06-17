@@ -1,6 +1,6 @@
 {
   "name": "beacon-aggregator",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Location-aware emergency incident aggregator for BEACON",
   "main": "server.js",
   "type": "commonjs",
